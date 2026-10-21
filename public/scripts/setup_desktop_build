@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+#
+# One-time (and idempotent) setup for building the EnvKey desktop app, CLI and
+# envkey-source for mac / linux / windows from a mac or linux host.
+#
+#   public/scripts/setup_desktop_build [--force]
+#
+#   --force   reinstall npm dependencies even if node_modules already exists
+#
+# What it does:
+#   1. installs Node (version from .nvmrc) via proto or fnm, if not already active
+#   2. makes node-gyp work on new Pythons (distutils was removed in 3.12) with a venv
+#   3. npm ci in the repo root and in public/app
+#   4. installs `pkg` and downloads its prebuilt base binaries (the CLI is a pkg binary)
+#   5. downloads prebuilt keytar (N-API) for every platform
+#   6. pre-downloads Go modules for envkey-source
+#   7. writes $ENVKEY_BUILD_DIR/env.sh -- `source` it before building
+#
+# Everything outside the repo goes in $ENVKEY_BUILD_DIR (default ~/.envkey-build)
+# and $PKG_CACHE_PATH (default ~/.pkg-cache).
+#
+# NOTE: the download steps need GitHub release assets (pkg-fetch, node-keytar).
+
+set -euo pipefail
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+REPO_ROOT=$( cd -- "$SCRIPT_DIR/../.." &> /dev/null && pwd )
+BUILD_DIR="${ENVKEY_BUILD_DIR:-$HOME/.envkey-build}"
+PKG_CACHE="${PKG_CACHE_PATH:-$HOME/.pkg-cache}"
+
+NODE_VERSION=$(tr -d '[:space:]' < "$REPO_ROOT/.nvmrc")
+# pkg@5.8.1 uses pkg-fetch v3.4 and its node16 base is 16.16.0 -- keep these in sync
+PKG_VERSION=5.8.1
+PKG_FETCH_TAG=v3.4
+PKG_BASE_NODE=v16.16.0
+PKG_TARGETS="macos-arm64 macos-x64 linux-x64 linux-arm64 win-x64"
+KEYTAR_PLATFORMS="darwin-arm64 darwin-x64 win32-x64 linux-x64"
+
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
+
+step() { printf '\n==> %s\n' "$*"; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+sha256() { if command -v shasum >/dev/null; then shasum -a 256 "$1" | awk '{print $1}'; else sha256sum "$1" | awk '{print $1}'; fi; }
+
+# curl with retries -- GitHub's release CDN returns transient 503s
+download() {
+  local url=$1 out=$2 i
+  for i in 1 2 3 4 5; do
+    if curl -fsSL -o "$out.part" "$url"; then mv "$out.part" "$out"; return 0; fi
+    echo "  download failed (attempt $i/5): $url" >&2
+    sleep $((i * 10))
+  done
+  rm -f "$out.part"
+  return 1
+}
+
+mkdir -p "$BUILD_DIR"
+
+# ---------------------------------------------------------------- prerequisites
+step "Checking prerequisites"
+for bin in git curl tar python3 go; do
+  command -v "$bin" >/dev/null || die "'$bin' is required but not installed"
+done
+if [ "$(uname)" = "Darwin" ]; then
+  xcode-select -p >/dev/null 2>&1 || die "Xcode command line tools are required (xcode-select --install)"
+fi
+echo "go: $(go version)"
+
+# ----------------------------------------------------------------------- node
+step "Node $NODE_VERSION"
+if [ "$(node -v 2>/dev/null || true)" = "v$NODE_VERSION" ]; then
+  # execPath, not `command -v node`: with proto/fnm the latter is a shim whose npm may be newer
+  NODE_BIN_DIR=$(dirname "$(node -p process.execPath)")
+elif command -v proto >/dev/null; then
+  proto install node "$NODE_VERSION"
+  NODE_BIN_DIR="$HOME/.proto/tools/node/$NODE_VERSION/bin"
+elif command -v fnm >/dev/null; then
+  fnm install "$NODE_VERSION"
+  NODE_BIN_DIR=$(dirname "$(fnm exec --using="$NODE_VERSION" which node)")
+else
+  die "Node $NODE_VERSION not active and neither proto nor fnm found. Install one of them (or activate Node $NODE_VERSION) and re-run."
+fi
+[ -x "$NODE_BIN_DIR/node" ] || die "node not found in $NODE_BIN_DIR"
+# Put this node's *bundled* npm first: npm 10 (from a newer global node) warns/breaks on node 16.
+export PATH="$NODE_BIN_DIR:$PATH"
+echo "node $(node -v), npm $(npm -v) ($NODE_BIN_DIR)"
+[ "$(npm -v | cut -d. -f1)" -lt 9 ] || die "npm $(npm -v) does not support node $NODE_VERSION (peer-dep resolution breaks); expected the npm bundled with node"
+
+# ---------------------------------------------------------------------- python
+step "Python for node-gyp"
+if python3 -c "import distutils" 2>/dev/null; then
+  PYTHON_BIN=$(command -v python3)
+else
+  echo "python3 has no distutils (Python >= 3.12) -- creating a venv with setuptools"
+  [ -x "$BUILD_DIR/pyenv/bin/python" ] || python3 -m venv "$BUILD_DIR/pyenv"
+  "$BUILD_DIR/pyenv/bin/pip" install -q setuptools
+  PYTHON_BIN="$BUILD_DIR/pyenv/bin/python"
+fi
+export npm_config_python="$PYTHON_BIN"
+echo "node-gyp python: $PYTHON_BIN"
+
+# ------------------------------------------------------------------------ npm
+step "npm dependencies"
+npm_install_in() {
+  local dir=$1
+  if [ "$FORCE" = 0 ] && [ -d "$dir/node_modules" ]; then
+    echo "$dir: node_modules exists, skipping (use --force to reinstall)"
+  else
+    echo "$dir: npm ci"
+    (cd "$dir" && npm ci --no-audit --no-fund)
+  fi
+}
+npm_install_in "$REPO_ROOT"
+npm_install_in "$REPO_ROOT/public/app"
+
+# ------------------------------------------------------------------------ pkg
+step "pkg $PKG_VERSION"
+if [ ! -x "$BUILD_DIR/pkgtool/node_modules/.bin/pkg" ]; then
+  mkdir -p "$BUILD_DIR/pkgtool"
+  (cd "$BUILD_DIR/pkgtool" && { [ -f package.json ] || npm init -y >/dev/null; } && npm i --no-audit --no-fund "pkg@$PKG_VERSION")
+fi
+echo "pkg: $("$BUILD_DIR/pkgtool/node_modules/.bin/pkg" --version)"
+
+step "pkg base binaries ($PKG_BASE_NODE) -> $PKG_CACHE/$PKG_FETCH_TAG"
+# Without these pkg tries to compile Node from source, which fails when cross-targeting.
+mkdir -p "$PKG_CACHE/$PKG_FETCH_TAG"
+for t in $PKG_TARGETS; do
+  dest="$PKG_CACHE/$PKG_FETCH_TAG/fetched-$PKG_BASE_NODE-$t"
+  if [ -x "$dest" ]; then echo "$t: cached"; continue; fi
+  base="https://github.com/vercel/pkg-fetch/releases/download/$PKG_FETCH_TAG/node-$PKG_BASE_NODE-$t"
+  tmp="$BUILD_DIR/dl-pkgbase-$t"
+  download "$base" "$tmp" || die "could not download $base"
+  download "$base.sha256sum" "$tmp.sha" || die "could not download $base.sha256sum"
+  [ "$(awk '{print $1}' "$tmp.sha")" = "$(sha256 "$tmp")" ] || { rm -f "$tmp" "$tmp.sha"; die "sha256 mismatch for $t"; }
+  chmod +x "$tmp"; mv "$tmp" "$dest"; rm -f "$tmp.sha"
+  echo "$t: downloaded + verified"
+done
+
+# --------------------------------------------------------------------- keytar
+step "keytar prebuilds (N-API, same binary for node and electron)"
+KEYTAR_VERSION=$(node -p "require('$REPO_ROOT/public/app/node_modules/keytar/package.json').version")
+for p in $KEYTAR_PLATFORMS; do
+  out="$BUILD_DIR/keytar/$p"
+  if [ -f "$out/build/Release/keytar.node" ]; then echo "$p: cached"; continue; fi
+  mkdir -p "$out"
+  download "https://github.com/atom/node-keytar/releases/download/v$KEYTAR_VERSION/keytar-v$KEYTAR_VERSION-napi-v3-$p.tar.gz" "$BUILD_DIR/keytar/$p.tgz" \
+    || die "could not download keytar $KEYTAR_VERSION for $p"
+  tar xzf "$BUILD_DIR/keytar/$p.tgz" -C "$out"
+  [ -f "$out/build/Release/keytar.node" ] || die "keytar archive for $p has no build/Release/keytar.node"
+  echo "$p: ok (keytar $KEYTAR_VERSION)"
+done
+
+# ------------------------------------------------------------------------- go
+step "Go modules for envkey-source"
+(cd "$REPO_ROOT/public/sdks/envkey-source" && go mod download)
+
+# --------------------------------------------------------------------- env.sh
+step "Writing $BUILD_DIR/env.sh"
+cat > "$BUILD_DIR/env.sh" <<EOF
+# generated by public/scripts/setup_desktop_build -- source this before building
+export ENVKEY_BUILD_DIR="$BUILD_DIR"
+export PATH="$NODE_BIN_DIR:\$PATH"
+export npm_config_python="$PYTHON_BIN"
+export NODE_OPTIONS=--max-old-space-size=8192
+export PKG_CACHE_PATH="$PKG_CACHE"
+export ENVKEY_PKG_BIN="$BUILD_DIR/pkgtool/node_modules/.bin/pkg"
+export ENVKEY_KEYTAR_DIR="$BUILD_DIR/keytar"
+EOF
+
+step "Verifying"
+for f in \
+  "$REPO_ROOT/node_modules/.bin/webpack" \
+  "$REPO_ROOT/node_modules/.bin/electron-builder" \
+  "$REPO_ROOT/node_modules/.bin/electron" \
+  "$BUILD_DIR/pkgtool/node_modules/.bin/pkg"; do
+  [ -x "$f" ] || die "missing $f"
+  echo "ok  ${f#$REPO_ROOT/}"
+done
+
+cat <<EOF
+
+Setup done. Before building:
+
+  source $BUILD_DIR/env.sh
+
+Build entry points that already exist in the repo:
+  public/scripts/build_worker           core worker bundle
+  public/app/client/ui  (npm run build) UI bundle
+  public/scripts/build_electron         Electron main/preload (NODE_ENV=production)
+  public/app/client/cli (npm run build) CLI webpack bundle (then package with pkg)
+EOF
